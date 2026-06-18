@@ -2,7 +2,7 @@
 
 <img src="img/spot.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -29,7 +29,7 @@ launched, exits cleanly on Esc.
 |------|--------|----------|
 | **spotlight** | ✓ shipped (v0.1.0) | `Mod4+Shift+s` (tile) |
 | **draw** (annotate) | ✓ shipped (v0.2.0) | `Mod4+Shift+d` (tile) |
-| **highlight** (drag-rect) | planned | `Mod4+Shift+h` |
+| **highlight** (drag-rect) | ✓ shipped (v0.3.0) | `Mod4+Shift+h` (tile) |
 
 ## Install
 
@@ -45,6 +45,7 @@ Add toggle bindings to `~/.tilerc` (same key launches and kills):
 ```
 bind Mod4+Shift+s   exec sh -c 'pkill -x spot || exec spot'
 bind Mod4+Shift+d   exec sh -c 'pkill -x spot || exec spot draw'
+bind Mod4+Shift+h   exec sh -c 'pkill -x spot || exec spot highlight'
 ```
 
 First press launches spot; second press kills it. Esc and every other

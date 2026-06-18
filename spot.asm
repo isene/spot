@@ -149,14 +149,20 @@ start_sec:           resq 1            ; CLOCK_MONOTONIC seconds at startup
 
 ; Draw mode state
 draw_mode:           resb 1            ; 1 if `spot draw`, 0 if spotlight
+highlight_mode:      resb 1            ; 1 if `spot highlight`
 alignb 4
 draw_color:          resd 1            ; SPOT_COLOR env (24-bit RGB)
 draw_width:          resd 1            ; SPOT_WIDTH env (pixels)
 draw_gc:             resd 1            ; GC for stroke drawing
 draw_x:              resw 1            ; previous stroke point
 draw_y:              resw 1
-drawing:             resb 1            ; 1 while a button is held
+drawing:             resb 1            ; 1 while a button is held (draw)
+highlighting:        resb 1            ; 1 while a button is held (highlight)
 alignb 4
+hl_x1:               resw 1            ; rubber-band anchor (button press)
+hl_y1:               resw 1
+hl_x2:               resw 1            ; current end (motion / release)
+hl_y2:               resw 1
 
 ; circle_hw[i] = floor(sqrt(R² - i²)), for i in 0..R inclusive
 circle_hw:           resw SPOT_RADIUS + 1
@@ -200,16 +206,29 @@ _start:
     mov rax, [rsp]                  ; argc
     lea rcx, [rsp + 8 + rax*8 + 8]  ; envp
     mov [envp], rcx
-    ; argv[1] = "draw" → draw mode. Otherwise spotlight.
+    ; argv[1] selects mode. "draw" → draw, "highlight" → highlight,
+    ; anything else (incl. no arg) → spotlight.
     cmp rax, 2
-    jl .skip_draw_check
+    jl .skip_mode_check
     mov rcx, [rsp + 16]             ; argv[1]
     cmp dword [rcx], 'draw'
-    jne .skip_draw_check
+    jne .check_highlight
     cmp byte [rcx + 4], 0
-    jne .skip_draw_check
+    jne .skip_mode_check
     mov byte [draw_mode], 1
-.skip_draw_check:
+    jmp .skip_mode_check
+.check_highlight:
+    cmp dword [rcx], 'high'
+    jne .skip_mode_check
+    cmp dword [rcx + 4], 'ligh'
+    jne .skip_mode_check
+    ; bytes 8-9 must be 't' then NUL
+    cmp byte [rcx + 8], 't'
+    jne .skip_mode_check
+    cmp byte [rcx + 9], 0
+    jne .skip_mode_check
+    mov byte [highlight_mode], 1
+.skip_mode_check:
 
     call parse_display
     call read_xauthority
@@ -245,10 +264,21 @@ _start:
     call upload_snapshot
 
     cmp byte [draw_mode], 0
-    je .spotlight_setup
+    je .check_highlight_setup
     ; Draw mode setup: GC on the pixmap, overlay listens for buttons.
     call create_draw_gc
     call create_overlay             ; event mask picks up draw_mode
+    call x11_flush
+    call event_loop
+    jmp .done
+
+.check_highlight_setup:
+    cmp byte [highlight_mode], 0
+    je .spotlight_setup
+    ; Highlight mode: overlay listens for buttons; we own the pointer.
+    ; Starts as full-dim cover (no SHAPE bounding hole). First drag sets
+    ; the rect; further drags re-set it.
+    call create_overlay
     call x11_flush
     call event_loop
     jmp .done
@@ -746,10 +776,12 @@ create_overlay:
     mov edx, [snapshot_pixmap]
     mov [rdi+32], edx                   ; back pixmap = dimmed root snapshot
     mov dword [rdi+36], 1               ; override = true
-    ; Event mask varies by mode: draw mode also takes button + motion events.
+    ; Event mask varies by mode: draw and highlight both want button events.
     mov edx, EVMASK_KEY_PRESS | EVMASK_EXPOSURE | EVMASK_STRUCTURE
-    cmp byte [draw_mode], 0
-    je .co_mask_done
+    mov al, [draw_mode]
+    or al, [highlight_mode]
+    test al, al
+    jz .co_mask_done
     or edx, EVMASK_BUTTON_PRESS | EVMASK_BUTTON_RELEASE | EVMASK_BUTTON1_MOTION
 .co_mask_done:
     mov [rdi+40], edx
@@ -1364,6 +1396,113 @@ upload_snapshot:
     ret
 
 ; ============================================================================
+; set_bounding_rect — SHAPE Rectangles op=Set, kind=Bounding. Four frame
+; rects forming a hole at the rectangle (hl_x1, hl_y1) - (hl_x2, hl_y2)
+; (normalized). The hole exposes the snapshot's content for that rectangle;
+; everything else stays as the dimmed surround.
+; ============================================================================
+set_bounding_rect:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    movzx r14d, word [screen_w]
+    movzx r15d, word [screen_h]
+    ; Normalize the rectangle corners.
+    movzx eax, word [hl_x1]
+    movzx ecx, word [hl_x2]
+    cmp eax, ecx
+    jle .sr_x_ok
+    xchg eax, ecx
+.sr_x_ok:
+    ; clamp to screen
+    test eax, eax
+    jns .sr_x1_pos
+    xor eax, eax
+.sr_x1_pos:
+    cmp ecx, r14d
+    jle .sr_x2_ok
+    mov ecx, r14d
+.sr_x2_ok:
+    mov ebx, eax                    ; x1
+    mov r12d, ecx                   ; x2
+    movzx eax, word [hl_y1]
+    movzx ecx, word [hl_y2]
+    cmp eax, ecx
+    jle .sr_y_ok
+    xchg eax, ecx
+.sr_y_ok:
+    test eax, eax
+    jns .sr_y1_pos
+    xor eax, eax
+.sr_y1_pos:
+    cmp ecx, r15d
+    jle .sr_y2_ok
+    mov ecx, r15d
+.sr_y2_ok:
+    ; rbx = x1, r12 = x2, eax = y1, ecx = y2, r14 = W, r15 = H
+    ; Build request header
+    lea rdi, [bounds_buf]
+    mov dl, [shape_major]
+    mov [rdi], dl
+    mov byte [rdi+1], SHAPE_RECTANGLES
+    mov word [rdi+2], 12            ; 4 header words + 4 rects × 2 = 12
+    mov byte [rdi+4], SHAPE_SET
+    mov byte [rdi+5], SHAPE_KIND_BOUNDING
+    mov byte [rdi+6], SHAPE_UNSORTED
+    mov byte [rdi+7], 0
+    mov edx, [overlay_win]
+    mov [rdi+8], edx
+    mov word [rdi+12], 0
+    mov word [rdi+14], 0
+    ; rect 1: TOP — (0, 0, W, y1)
+    lea rdi, [bounds_buf + 16]
+    mov word [rdi], 0
+    mov word [rdi+2], 0
+    mov [rdi+4], r14w
+    mov [rdi+6], ax                 ; y1
+    ; rect 2: BOTTOM — (0, y2, W, H-y2)
+    mov word [rdi+8], 0
+    mov [rdi+10], cx                ; y2
+    mov [rdi+12], r14w
+    mov r13d, r15d
+    sub r13d, ecx
+    mov [rdi+14], r13w
+    ; rect 3: LEFT — (0, y1, x1, y2-y1)
+    mov word [rdi+16], 0
+    mov [rdi+18], ax
+    mov [rdi+20], bx                ; x1 (width)
+    mov r13d, ecx
+    sub r13d, eax                   ; y2 - y1
+    mov [rdi+22], r13w
+    ; rect 4: RIGHT — (x2, y1, W-x2, y2-y1)
+    mov [rdi+24], r12w              ; x2
+    mov [rdi+26], ax
+    mov r13d, r14d
+    sub r13d, r12d                  ; W - x2
+    mov [rdi+28], r13w
+    mov r13d, ecx
+    sub r13d, eax
+    mov [rdi+30], r13w
+    ; send via direct write (smaller than the bounds_buf cap)
+    push rdx
+    call x11_flush
+    pop rdx
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [bounds_buf]
+    mov rdx, 48                     ; 16 header + 32 rects
+    syscall
+    inc dword [x11_seq]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
 ; create_draw_gc — GC on the snapshot pixmap with the user's colour, width,
 ; and round caps/joins (so strokes look hand-drawn, not boxy).
 ; ============================================================================
@@ -1797,11 +1936,16 @@ event_loop:
     syscall
     cmp rax, 32
     jl .el_loop
-    cmp byte [draw_mode], 0
-    je .el_loop                      ; spotlight: drain & ignore
-    ; Draw mode dispatch — pointer events drive the stroke.
     movzx eax, byte [read_buf]
     and eax, 0x7F
+    ; Dispatch only when the active mode cares; spotlight ignores all events.
+    cmp byte [draw_mode], 0
+    jne .el_draw_dispatch
+    cmp byte [highlight_mode], 0
+    jne .el_hl_dispatch
+    jmp .el_loop                     ; spotlight: drain & ignore
+
+.el_draw_dispatch:
     cmp eax, EV_BUTTON_PRESS
     je .el_btn_press
     cmp eax, EV_BUTTON_RELEASE
@@ -1813,7 +1957,7 @@ event_loop:
 .el_btn_press:
     movzx eax, word [read_buf + 24]  ; event_x
     mov [draw_x], ax
-    mov [cursor_x], ax               ; cursor_* reused as "latest point"
+    mov [cursor_x], ax
     movzx eax, word [read_buf + 26]  ; event_y
     mov [draw_y], ax
     mov [cursor_y], ax
@@ -1839,9 +1983,49 @@ event_loop:
     mov [draw_y], ax
     jmp .el_loop
 
+.el_hl_dispatch:
+    cmp eax, EV_BUTTON_PRESS
+    je .el_hl_press
+    cmp eax, EV_BUTTON_RELEASE
+    je .el_hl_release
+    cmp eax, EV_MOTION_NOTIFY
+    je .el_hl_motion
+    jmp .el_loop
+
+.el_hl_press:
+    movzx eax, word [read_buf + 24]
+    mov [hl_x1], ax
+    mov [hl_x2], ax
+    movzx eax, word [read_buf + 26]
+    mov [hl_y1], ax
+    mov [hl_y2], ax
+    mov byte [highlighting], 1
+    jmp .el_loop
+
+.el_hl_motion:
+    cmp byte [highlighting], 0
+    je .el_loop
+    movzx eax, word [read_buf + 24]
+    mov [hl_x2], ax
+    movzx eax, word [read_buf + 26]
+    mov [hl_y2], ax
+    call set_bounding_rect
+    jmp .el_loop
+
+.el_hl_release:
+    movzx eax, word [read_buf + 24]
+    mov [hl_x2], ax
+    movzx eax, word [read_buf + 26]
+    mov [hl_y2], ax
+    mov byte [highlighting], 0
+    call set_bounding_rect
+    jmp .el_loop
+
 .el_tick:
     ; Tick path is only useful in spotlight mode (cursor-follow redraw).
     cmp byte [draw_mode], 0
+    jne .el_loop
+    cmp byte [highlight_mode], 0
     jne .el_loop
     call query_pointer_once_silent
     movzx eax, word [cursor_x]
