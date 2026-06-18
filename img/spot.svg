@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1b26"/>
+      <stop offset="100%" style="stop-color:#0a0a14"/>
+    </linearGradient>
+    <linearGradient id="word-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#f7c948"/>
+      <stop offset="100%" style="stop-color:#fff0a3"/>
+    </linearGradient>
+    <radialGradient id="spotlight" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#fff8d0;stop-opacity:1"/>
+      <stop offset="65%" style="stop-color:#f7c948;stop-opacity:0.85"/>
+      <stop offset="100%" style="stop-color:#f7c948;stop-opacity:0"/>
+    </radialGradient>
+    <mask id="hole">
+      <rect x="0" y="0" width="256" height="256" fill="white"/>
+      <circle cx="138" cy="120" r="34" fill="black"/>
+    </mask>
+  </defs>
+
+  <!-- Same circular frame as the rest of the suite -->
+  <circle cx="128" cy="128" r="120" fill="url(#bg)" stroke="url(#word-grad)" stroke-width="3"/>
+
+  <!-- Darkened screen rectangle inside the frame -->
+  <g mask="url(#hole)">
+    <rect x="42" y="70" width="172" height="120" rx="6" ry="6"
+          fill="#0d0e16" opacity="0.92"/>
+  </g>
+
+  <!-- The bright spotlight cone — soft glow + sharp inner ring -->
+  <circle cx="138" cy="120" r="48" fill="url(#spotlight)" opacity="0.55"/>
+  <circle cx="138" cy="120" r="34" fill="none"
+          stroke="#fff0a3" stroke-width="1.5" opacity="0.95"/>
+
+  <!-- Arrow cursor at the centre of the spotlight -->
+  <path d="M 132 112 L 132 138 L 138 132 L 144 145 L 149 142 L 143 130 L 152 130 Z"
+        fill="#1a1b26" stroke="#fff0a3" stroke-width="1.4" stroke-linejoin="round"/>
+
+  <!-- Wordmark -->
+  <text x="128" y="222" font-family="monospace" font-size="28" font-weight="bold"
+        fill="#f7c948" text-anchor="middle" letter-spacing="3">spot</text>
+</svg>
