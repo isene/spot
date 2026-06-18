@@ -2,7 +2,7 @@
 
 <img src="img/spot.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.4-blue)
+![Version](https://img.shields.io/badge/version-0.1.5-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -40,11 +40,15 @@ make
 sudo make install
 ```
 
-Add to `~/.tilerc`:
+Add a toggle binding to `~/.tilerc` (same key launches and kills):
 
 ```
-bind Mod4+Shift+s   exec spot
+bind Mod4+Shift+s   exec sh -c 'pkill -x spot || exec spot'
 ```
+
+First press launches spot; second press kills it. Esc and q pass through
+to whatever application has focus — type into the terminal, click in the
+slides, anything underneath stays interactive while the spotlight is up.
 
 ## Configuration
 

@@ -181,9 +181,11 @@ _start:
     call query_shape
     cmp byte [shape_major], 0
     je .die_shape
-    call query_keymap               ; resolve XK_Escape/XK_q → real keycodes
-    call debug_log                  ; v0.1.4: write /tmp/spot.log diagnostics
-    call get_start_time             ; v0.1.4: seed 60-second auto-exit timer
+    ; v0.1.5: no key grab. Esc / q pass through to the focused app so the
+    ; presenter can keep typing while the spotlight is up. Exit is via
+    ; SIGTERM (e.g. pkill spot, or a toggle keybinding):
+    ;   bind Mod4+Shift+s   exec sh -c 'pkill -x spot || exec spot'
+    ; — first press launches, second kills.
 
     ; Snapshot pipeline — capture root BEFORE creating our window so the
     ; image doesn't include us. Dim in memory, upload as a server pixmap
@@ -194,7 +196,6 @@ _start:
     call create_snapshot_pixmap
     call upload_snapshot
 
-    call grab_keys                  ; passive Esc/q grab on root FIRST
     call create_overlay
     call set_input_passthrough
     call x11_flush
@@ -1523,28 +1524,12 @@ event_loop:
     lea rsi, [read_buf]
     mov rdx, 32
     syscall
-    cmp rax, 32
-    jl .el_loop
-    movzx eax, byte [read_buf]
-    and eax, 0x7F
-    cmp eax, EV_KEY_PRESS
-    je .el_keypress
-    jmp .el_loop
-
-.el_keypress:
-    movzx eax, byte [read_buf + 1]
-    movzx ecx, byte [esc_keycode]
-    cmp eax, ecx
-    je .el_exit
-    movzx ecx, byte [q_keycode]
-    cmp eax, ecx
-    je .el_exit
+    ; v0.1.5: we don't grab keys; any X event we read is uninteresting
+    ; (it's almost always replies/errors we never queue answers for).
+    ; Just drain and continue. SIGTERM is the exit path.
     jmp .el_loop
 
 .el_tick:
-    ; v0.1.4 safety net — auto-exit after 60s no matter what.
-    call check_timeout
-    jg .el_exit
     call query_pointer_once_silent
     movzx eax, word [cursor_x]
     movzx ecx, word [last_x]
@@ -1601,20 +1586,11 @@ query_pointer_once_silent:
 ; cleanup — ungrab + destroy.
 ; ============================================================================
 cleanup:
-    ; UngrabKey(root, Esc/q, AnyModifier) using the dynamically-resolved
-    ; keycodes from query_keymap. Skip when 0 (grab never installed).
-    push rbx
-    mov bl, [esc_keycode]
-    test bl, bl
-    jz .cu_skip_esc
-    call .cu_ungrab
-.cu_skip_esc:
-    mov bl, [q_keycode]
-    test bl, bl
-    jz .cu_skip_q
-    call .cu_ungrab
-.cu_skip_q:
-    pop rbx
+    ; v0.1.5: no grabs to release; SIGTERM brings us here only via the
+    ; exit-on-event path that no longer exists, so cleanup is just window
+    ; teardown. In practice SIGTERM kills us immediately and the X server
+    ; tears down our resources at connection-close; this path exists for
+    ; tidiness if a future graceful exit is added.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_DESTROY_WINDOW
     mov byte [rdi+1], 0
