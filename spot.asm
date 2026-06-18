@@ -25,6 +25,12 @@ DEFAULT REL
 %define SYS_EXIT        60
 %define SYS_SOCKET      41
 %define SYS_CONNECT     42
+%define SYS_CLOCK_GETTIME 228
+%define CLOCK_MONOTONIC 1
+
+%define O_WRONLY        1
+%define O_CREAT         0x40
+%define O_TRUNC         0x200
 
 %define AF_UNIX         1
 %define SOCK_STREAM     1
@@ -119,6 +125,7 @@ cursor_x:            resw 1
 cursor_y:            resw 1
 last_x:              resw 1
 last_y:              resw 1
+start_sec:           resq 1            ; CLOCK_MONOTONIC seconds at startup
 
 ; circle_hw[i] = floor(sqrt(R² - i²)), for i in 0..R inclusive
 circle_hw:           resw SPOT_RADIUS + 1
@@ -175,6 +182,8 @@ _start:
     cmp byte [shape_major], 0
     je .die_shape
     call query_keymap               ; resolve XK_Escape/XK_q → real keycodes
+    call debug_log                  ; v0.1.4: write /tmp/spot.log diagnostics
+    call get_start_time             ; v0.1.4: seed 60-second auto-exit timer
 
     ; Snapshot pipeline — capture root BEFORE creating our window so the
     ; image doesn't include us. Dim in memory, upload as a server pixmap
@@ -1197,6 +1206,110 @@ upload_snapshot:
     ret
 
 ; ============================================================================
+; debug_log — write keycode diagnostics to /tmp/spot.log. Helps explain why
+; Esc/q grabs don't fire when v0.1.3 left a user locked out under tile.
+; Format (text + a trailing raw-byte tuple for hex-tool eyeballing):
+;     min=N max=N esc=N q=N\n<raw 4 bytes>
+; Removed once Esc reliably works across non-Xephyr keymaps.
+; ============================================================================
+debug_log:
+    push rbx
+    push r12
+    mov rax, SYS_OPEN
+    lea rdi, [.dl_path]
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov edx, 0o644                  ; NASM: octal needs the 0o prefix
+    syscall
+    test rax, rax
+    js .dl_done
+    mov rbx, rax                    ; fd
+    lea r12, [tmp_buf]
+    ; "min="
+    mov dword [r12], 'min='
+    add r12, 4
+    movzx eax, byte [min_keycode]
+    mov rdi, r12
+    call itoa_in_place              ; rdi now points AT the NUL byte
+    mov byte [rdi], ' '             ; replace NUL with separator
+    lea r12, [rdi + 1]
+    mov dword [r12], 'max='
+    add r12, 4
+    movzx eax, byte [max_keycode]
+    mov rdi, r12
+    call itoa_in_place
+    mov byte [rdi], ' '
+    lea r12, [rdi + 1]
+    mov dword [r12], 'esc='
+    add r12, 4
+    movzx eax, byte [esc_keycode]
+    mov rdi, r12
+    call itoa_in_place
+    mov byte [rdi], ' '
+    lea r12, [rdi + 1]
+    mov word [r12], 'q='
+    add r12, 2
+    movzx eax, byte [q_keycode]
+    mov rdi, r12
+    call itoa_in_place
+    mov byte [rdi], 10              ; LF in place of NUL
+    lea r12, [rdi + 1]
+    ; append raw 4 bytes for hex viewing
+    mov al, [min_keycode]
+    mov [r12], al
+    mov al, [max_keycode]
+    mov [r12 + 1], al
+    mov al, [esc_keycode]
+    mov [r12 + 2], al
+    mov al, [q_keycode]
+    mov [r12 + 3], al
+    add r12, 4
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [tmp_buf]
+    lea rdx, [r12]
+    sub rdx, rsi
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+.dl_done:
+    pop r12
+    pop rbx
+    ret
+.dl_path: db "/tmp/spot.log", 0
+
+; ============================================================================
+; get_start_time — clock_gettime(CLOCK_MONOTONIC); save tv_sec for timeout.
+; ============================================================================
+get_start_time:
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    mov [start_sec], rax
+    add rsp, 16
+    ret
+
+; ============================================================================
+; check_timeout — exit spot if it's been running for > 60s. Safety net for
+; "I can't make Esc work and the screen is stuck" — guarantees recovery.
+; Returns ZF=1 (use je .el_exit) if timed out.
+; ============================================================================
+check_timeout:
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    sub rax, [start_sec]
+    add rsp, 16
+    cmp rax, 60
+    ret
+
+; ============================================================================
 ; query_keymap — GetKeyboardMapping for [min_keycode .. max_keycode], scan
 ; the keysym body for XK_Escape (0xFF1B) and XK_q (0x71), populate the
 ; *_keycode globals. v0.1.1 hard-coded kc=9/24 which is wrong on layouts
@@ -1429,6 +1542,9 @@ event_loop:
     jmp .el_loop
 
 .el_tick:
+    ; v0.1.4 safety net — auto-exit after 60s no matter what.
+    call check_timeout
+    jg .el_exit
     call query_pointer_once_silent
     movzx eax, word [cursor_x]
     movzx ecx, word [last_x]
