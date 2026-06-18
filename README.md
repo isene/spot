@@ -2,7 +2,7 @@
 
 <img src="img/spot.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![Version](https://img.shields.io/badge/version-0.1.1-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -46,21 +46,50 @@ Add to `~/.tilerc`:
 bind Mod4+Shift+s   exec spot
 ```
 
+## Configuration
+
+`SPOT_DIM=<0..100>` env var controls the surround brightness:
+
+| Value | Effect |
+|-------|--------|
+| `100` | pure black surround |
+| `80`  | default — `#333333` |
+| `50`  | medium gray `#808080` |
+| `0`   | white surround |
+
+```
+bind Mod4+Shift+s   exec env SPOT_DIM=70 spot
+```
+
+Honest caveat: the overlay is **opaque**, not transparent. Without a
+compositor, "dim" means "what colour the surround is painted." It does
+not show the content underneath darkened — the content is hidden. If
+you need true see-through dimming, you need an X compositor running
+(picom / xcompmgr); a future version may detect that and switch to an
+ARGB visual + RENDER blend.
+
 ## How it works
 
-- Override-redirect InputOutput window covers the root with a dark-gray
-  fill (`#202020`). The X server's free background fill does the painting;
-  no per-frame draw calls.
+- Override-redirect InputOutput window covers the root with a fill
+  computed from `SPOT_DIM`. The X server's free background fill does
+  the painting; no per-frame draw calls.
 - `SHAPE` extension, kind `Input`, rectangles `{}` → window has no input
-  region. All pointer events pass straight through to whatever's
-  underneath. You can keep clicking around in your presentation while
-  the spotlight is up.
-- `SHAPE` extension, kind `Bounding`, four rectangles forming a frame
-  around the cursor. The 280×280 square at the pointer is excluded →
-  underlying screen shows through.
-- Cursor tracking polls `XQueryPointer` at 30 Hz. On actual motion (delta
-  ≥ 1 px), a single `SHAPE Rectangles` request rewrites the bounding
-  frame. Still cursor = zero requests, zero CPU.
+  region. All pointer events pass straight through. You can keep
+  interacting with the application underneath while the spotlight is up.
+- `SHAPE` extension, kind `Bounding`, ~564 per-row rectangles
+  approximating a circle of radius 140 px. The disk at the pointer is
+  excluded → underlying screen shows through.
+- A precomputed `circle_hw[]` table holds the circle's horizontal
+  half-width at every row (built in ~140 iterations at startup, then
+  static).
+- Cursor tracking polls `XQueryPointer` at 30 Hz. On actual motion
+  (delta ≥ 1 px), one `SHAPE Rectangles` request rewrites the bound.
+  Still cursor = zero requests, zero CPU.
+- Passive `GrabKey` on root for **Esc** and **q** (AnyModifier) so the
+  keys reach us regardless of input focus. Avoids the v0.1.0 issue where
+  `GrabKeyboard` on the freshly-mapped overlay window could race with
+  the X server's `MapNotify` and silently fail (`NotViewable`), leaving
+  Esc unbound.
 
 ## Goals (CHasm rules in priority order)
 

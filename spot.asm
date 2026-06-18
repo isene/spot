@@ -34,10 +34,13 @@ DEFAULT REL
 %define X11_CREATE_WINDOW       1
 %define X11_DESTROY_WINDOW      4
 %define X11_MAP_WINDOW          8
-%define X11_GRAB_KEYBOARD       31
-%define X11_UNGRAB_KEYBOARD     32
+%define X11_GRAB_KEY            33
+%define X11_UNGRAB_KEY          34
 %define X11_QUERY_POINTER       38
 %define X11_QUERY_EXTENSION     98
+%define ANY_MODIFIER            0x8000
+%define KC_ESC                  9
+%define KC_Q                    24
 
 %define EV_KEY_PRESS            2
 %define EV_EXPOSE               12
@@ -64,8 +67,8 @@ DEFAULT REL
 %define SHAPE_UNSORTED          0
 
 ; ---- Layout ----------------------------------------------------------------
-%define SPOT_RADIUS             140       ; half-side of square hole in px
-%define DARK_PIXEL              0x202020  ; dark gray fill
+%define SPOT_RADIUS             140       ; spotlight radius in px
+%define DEFAULT_DIM             80        ; 0=white, 100=black; default ≈ #333333
 
 ; ============================================================================
 ; BSS
@@ -94,11 +97,16 @@ alignb 4
 overlay_win:         resd 1
 shape_major:         resb 1
 alignb 4
+dim_pct:             resd 1            ; SPOT_DIM env value, 0-100
+back_pixel:          resd 1            ; computed grayscale fill
 
 cursor_x:            resw 1
 cursor_y:            resw 1
 last_x:              resw 1
 last_y:              resw 1
+
+; circle_hw[i] = floor(sqrt(R² - i²)), for i in 0..R inclusive
+circle_hw:           resw SPOT_RADIUS + 1
 
 sockaddr_buf:        resb 128
 conn_setup_buf:      resb 32768
@@ -106,6 +114,9 @@ write_buf:           resb 65536
 write_pos:           resq 1
 read_buf:            resb 65536
 tmp_buf:             resb 256
+; bounds_buf holds the SHAPE_RECTANGLES request body. With ~280 rows
+; producing 2 rects each plus 2 caps, worst case ≈ 16 + 564*8 ≈ 4.5 KB.
+bounds_buf:          resb 8192
 
 ; ============================================================================
 ; RODATA
@@ -135,6 +146,8 @@ _start:
 
     call parse_display
     call read_xauthority
+    call parse_dim
+    call build_circle_table
     call x11_connect
     test rax, rax
     js .die_connect
@@ -143,12 +156,12 @@ _start:
     cmp byte [shape_major], 0
     je .die_shape
 
+    call grab_keys                  ; passive Esc/q grab on root FIRST
     call create_overlay
     call set_input_passthrough
-    call grab_keyboard
     call x11_flush
     call query_pointer_once
-    call set_bounding_hole
+    call set_bounding_circle
     call x11_flush
 
     call event_loop
@@ -625,7 +638,8 @@ create_overlay:
     mov word [rdi+22], INPUT_OUTPUT
     mov dword [rdi+24], COPY_FROM_PARENT ; visual
     mov dword [rdi+28], CW_BACK_PIXEL | CW_OVERRIDE_REDIRECT | CW_EVENT_MASK
-    mov dword [rdi+32], DARK_PIXEL      ; back pixel
+    mov edx, [back_pixel]
+    mov [rdi+32], edx                   ; back pixel (computed from dim_pct)
     mov dword [rdi+36], 1               ; override = true
     mov dword [rdi+40], EVMASK_KEY_PRESS | EVMASK_EXPOSURE | EVMASK_STRUCTURE
     lea rsi, [tmp_buf]
@@ -671,24 +685,101 @@ set_input_passthrough:
     ret
 
 ; ============================================================================
-; set_bounding_hole — SHAPE Rectangles op=Set, kind=Bounding. The bounding
-; region is FOUR rectangles forming a frame around the cursor: top strip,
-; bottom strip, left bar, right bar. The 2R×2R square at (cursor_x, cursor_y)
-; is excluded → desktop shows through there.
-;
-; Rectangle layout (cx, cy = cursor; R = SPOT_RADIUS; W,H = screen):
-;
-;   ┌──────────────────────────┐
-;   │           top            │   top:    (0, 0,  W,        cy-R)
-;   ├──────┬───────────┬───────┤
-;   │ left │   HOLE    │ right │   left:   (0, cy-R, cx-R,   2R)
-;   ├──────┴───────────┴───────┤   right:  (cx+R, cy-R, W-(cx+R), 2R)
-;   │          bottom          │   bottom: (0, cy+R, W,      H-(cy+R))
-;   └──────────────────────────┘
-;
-; Cropped against screen edges so we never send a negative width.
+; parse_dim — read SPOT_DIM from envp (0..100). Defaults to DEFAULT_DIM.
+; Then computes back_pixel = grayscale 0xRRGGBB with R=G=B = (100-dim)*255/100.
+;   dim=100 → 0x000000 (full black)
+;   dim=0   → 0xFFFFFF (white)
+;   dim=80  → 0x333333 (default, similar to old hard-coded 0x202020)
 ; ============================================================================
-set_bounding_hole:
+parse_dim:
+    mov dword [dim_pct], DEFAULT_DIM
+    mov rcx, [envp]
+.pd_loop:
+    mov rdi, [rcx]
+    test rdi, rdi
+    jz .pd_done
+    cmp dword [rdi], 'SPOT'
+    jne .pd_next
+    cmp dword [rdi+4], '_DIM'
+    jne .pd_next
+    cmp byte  [rdi+8], '='
+    jne .pd_next
+    add rdi, 9
+    xor eax, eax
+.pd_digit:
+    movzx edx, byte [rdi]
+    sub edx, '0'
+    cmp edx, 9
+    ja .pd_save
+    imul eax, eax, 10
+    add eax, edx
+    cmp eax, 100
+    jg .pd_done                     ; bad value → keep default
+    inc rdi
+    jmp .pd_digit
+.pd_save:
+    mov [dim_pct], eax
+    jmp .pd_done
+.pd_next:
+    add rcx, 8
+    jmp .pd_loop
+.pd_done:
+    ; gray = (100 - dim_pct) * 255 / 100
+    mov eax, 100
+    sub eax, [dim_pct]
+    imul eax, 255
+    mov ecx, 100
+    xor edx, edx
+    div ecx                         ; eax = gray (0..255)
+    mov edx, eax
+    shl eax, 16
+    or eax, edx
+    shl edx, 8
+    or eax, edx                     ; 0x00RRGGBB with R=G=B=gray
+    mov [back_pixel], eax
+    ret
+
+; ============================================================================
+; build_circle_table — circle_hw[i] = floor(sqrt(R*R - i*i)) for i in 0..R.
+; Walks x down from R, incremental compare: x*x ≤ target ≤ (x+1)*(x+1).
+; ============================================================================
+build_circle_table:
+    push rbx
+    push r12
+    push r13
+    mov r12d, SPOT_RADIUS           ; current x guess
+    xor r13d, r13d                  ; i = 0
+.bct_loop:
+    cmp r13d, SPOT_RADIUS + 1
+    jge .bct_done
+    mov eax, SPOT_RADIUS * SPOT_RADIUS
+    mov ecx, r13d
+    imul ecx, r13d
+    sub eax, ecx                    ; target = R² - i²
+.bct_shrink:
+    mov ecx, r12d
+    imul ecx, r12d
+    cmp ecx, eax
+    jle .bct_save
+    dec r12d
+    jmp .bct_shrink
+.bct_save:
+    lea rdi, [circle_hw]
+    mov [rdi + r13*2], r12w
+    inc r13d
+    jmp .bct_loop
+.bct_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; set_bounding_circle — SHAPE Rectangles op=Set, kind=Bounding, with a circular
+; hole. The bounding region is a top band, a bottom band, and two slivers per
+; row in [cy-R, cy+R-1]. Per-row half-width comes from circle_hw[].
+; ============================================================================
+set_bounding_circle:
     push rbx
     push r12
     push r13
@@ -700,84 +791,130 @@ set_bounding_hole:
     movzx r14d, word [screen_w]
     movzx r15d, word [screen_h]
 
-    ; hole bbox: x1=cx-R, y1=cy-R, x2=cx+R, y2=cy+R, clamped to [0..screen]
-    mov eax, r12d
-    sub eax, SPOT_RADIUS
-    jns .sb_x1_ok
-    xor eax, eax
-.sb_x1_ok:
-    mov ebx, eax                    ; x1
-    mov eax, r13d
-    sub eax, SPOT_RADIUS
-    jns .sb_y1_ok
-    xor eax, eax
-.sb_y1_ok:
-    mov ecx, eax                    ; y1
-    mov eax, r12d
-    add eax, SPOT_RADIUS
-    cmp eax, r14d
-    jle .sb_x2_ok
-    mov eax, r14d
-.sb_x2_ok:
-    mov edx, eax                    ; x2
-    mov eax, r13d
-    add eax, SPOT_RADIUS
-    cmp eax, r15d
-    jle .sb_y2_ok
-    mov eax, r15d
-.sb_y2_ok:
-    ; rdx = x2; rcx = y1; rbx = x1; rax = y2; r14 = W; r15 = H
-    ; Build 4 rectangles into tmp_buf+16 (16 = request header)
-    lea rdi, [tmp_buf]
-    mov r8b, [shape_major]
-    mov [rdi], r8b
+    ; Build request header at bounds_buf + 0..15.
+    lea rdi, [bounds_buf]
+    mov al, [shape_major]
+    mov [rdi], al
     mov byte [rdi+1], SHAPE_RECTANGLES
-    mov word [rdi+2], 4 + 4 * 2     ; 4 header words + 4 rects × 2 words
+    ; word [rdi+2] = length, filled in at end
     mov byte [rdi+4], SHAPE_SET
     mov byte [rdi+5], SHAPE_KIND_BOUNDING
     mov byte [rdi+6], SHAPE_UNSORTED
     mov byte [rdi+7], 0
-    mov r8d, [overlay_win]
-    mov [rdi+8], r8d
+    mov edx, [overlay_win]
+    mov [rdi+8], edx
     mov word [rdi+12], 0            ; x offset
     mov word [rdi+14], 0            ; y offset
 
-    ; rect 1: TOP — (0, 0, W, y1)
-    lea rdi, [tmp_buf + 16]
-    mov word [rdi], 0
-    mov word [rdi+2], 0
-    mov [rdi+4], r14w               ; W
-    mov [rdi+6], cx                 ; y1 (height)
+    ; rbx walks the rect output cursor.
+    lea rbx, [bounds_buf + 16]
 
-    ; rect 2: BOTTOM — (0, y2, W, H - y2)
-    mov word [rdi+8], 0
-    mov [rdi+10], ax                ; y2
-    mov [rdi+12], r14w              ; W
-    mov r9d, r15d
-    sub r9d, eax                    ; H - y2
-    mov [rdi+14], r9w
+    ; TOP band: (0, 0, W, cy-R) if cy > 0.
+    mov eax, r13d
+    sub eax, SPOT_RADIUS
+    jle .sbc_skip_top
+    mov word [rbx], 0
+    mov word [rbx+2], 0
+    mov [rbx+4], r14w
+    cmp eax, r15d
+    jle .sbc_top_clip
+    mov eax, r15d
+.sbc_top_clip:
+    mov [rbx+6], ax
+    add rbx, 8
+.sbc_skip_top:
 
-    ; rect 3: LEFT — (0, y1, x1, y2 - y1)
-    mov word [rdi+16], 0
-    mov [rdi+18], cx                ; y1
-    mov [rdi+20], bx                ; x1 (width)
-    mov r9d, eax
-    sub r9d, ecx                    ; y2 - y1
-    mov [rdi+22], r9w
+    ; BOTTOM band: (0, cy+R, W, H-(cy+R)) if cy+R < H.
+    mov eax, r13d
+    add eax, SPOT_RADIUS
+    cmp eax, r15d
+    jge .sbc_skip_bot
+    test eax, eax
+    jns .sbc_bot_ge0
+    xor eax, eax
+.sbc_bot_ge0:
+    mov word [rbx], 0
+    mov [rbx+2], ax                 ; y = cy + R
+    mov [rbx+4], r14w
+    mov ecx, r15d
+    sub ecx, eax                    ; H - (cy+R)
+    mov [rbx+6], cx
+    add rbx, 8
+.sbc_skip_bot:
 
-    ; rect 4: RIGHT — (x2, y1, W - x2, y2 - y1)
-    mov [rdi+24], dx                ; x2
-    mov [rdi+26], cx                ; y1
-    mov r9d, r14d
-    sub r9d, edx                    ; W - x2
-    mov [rdi+28], r9w
-    mov r9d, eax
-    sub r9d, ecx
-    mov [rdi+30], r9w
+    ; Per-row left/right slivers for y in [cy-R, cy+R-1].
+    ; r8d = y; r9d = signed y offset from cy (range -R .. R-1).
+    mov r8d, r13d
+    sub r8d, SPOT_RADIUS
+    mov r9d, -SPOT_RADIUS
+.sbc_row:
+    cmp r9d, SPOT_RADIUS
+    jge .sbc_rows_done
+    test r8d, r8d
+    js .sbc_row_advance
+    cmp r8d, r15d
+    jge .sbc_rows_done
+    mov eax, r9d
+    test eax, eax
+    jns .sbc_pos
+    neg eax
+.sbc_pos:
+    lea rcx, [circle_hw]
+    movzx eax, word [rcx + rax*2]   ; hw at this row
+    mov ecx, eax                    ; ecx = hw
+    ; LEFT sliver: (0, y, cx - hw, 1) if cx > hw.
+    mov edx, r12d
+    sub edx, ecx
+    jle .sbc_no_left
+    cmp edx, r14d
+    jle .sbc_left_ok
+    mov edx, r14d
+.sbc_left_ok:
+    mov word [rbx], 0
+    mov [rbx+2], r8w
+    mov [rbx+4], dx
+    mov word [rbx+6], 1
+    add rbx, 8
+.sbc_no_left:
+    ; RIGHT sliver: (cx + hw, y, W - (cx+hw), 1) if cx+hw < W.
+    mov edx, r12d
+    add edx, ecx
+    cmp edx, r14d
+    jge .sbc_no_right
+    test edx, edx
+    jns .sbc_right_ok
+    xor edx, edx
+.sbc_right_ok:
+    mov [rbx], dx
+    mov [rbx+2], r8w
+    mov eax, r14d
+    sub eax, edx
+    mov [rbx+4], ax
+    mov word [rbx+6], 1
+    add rbx, 8
+.sbc_no_right:
+.sbc_row_advance:
+    inc r8d
+    inc r9d
+    jmp .sbc_row
+.sbc_rows_done:
 
-    lea rsi, [tmp_buf]
-    mov rdx, 48
-    call x11_buffer
+    ; Total request length (bytes) and patch the length field.
+    lea rax, [bounds_buf]
+    sub rbx, rax                    ; total bytes
+    mov rdx, rbx                    ; save for write
+    shr rbx, 2                      ; length in 4-byte units
+    mov [bounds_buf + 2], bx
+
+    ; Flush any pending small requests, then write the bounds request direct.
+    ; (x11_flush clobbers rdx — save it.)
+    push rdx
+    call x11_flush
+    pop rdx
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [bounds_buf]
+    syscall
     inc dword [x11_seq]
 
     pop r15
@@ -788,18 +925,32 @@ set_bounding_hole:
     ret
 
 ; ============================================================================
-; grab_keyboard — GrabKeyboard so Esc reaches us regardless of pointer focus.
+; grab_keys — passive GrabKey on root for Esc and q with AnyModifier. These
+; grabs trigger an active grab on press → events route to us regardless of
+; current input focus, so Esc always works even while no window owns focus.
+; Doing the grabs BEFORE creating the overlay avoids any window-viewability
+; race that bit v0.1.0 (GrabKeyboard called pre-MapNotify → NotViewable).
 ; ============================================================================
-grab_keyboard:
+grab_keys:
+    push rbx
+    mov bl, KC_ESC
+    call .gk_one
+    mov bl, KC_Q
+    call .gk_one
+    pop rbx
+    ret
+.gk_one:
     lea rdi, [tmp_buf]
-    mov byte [rdi], X11_GRAB_KEYBOARD
-    mov byte [rdi+1], 1
+    mov byte [rdi], X11_GRAB_KEY
+    mov byte [rdi+1], 1                 ; owner_events
     mov word [rdi+2], 4
-    mov edx, [overlay_win]
+    mov edx, [root_window]
     mov [rdi+4], edx
-    mov dword [rdi+8], 0
-    mov byte [rdi+12], GRAB_MODE_ASYNC
-    mov byte [rdi+13], GRAB_MODE_ASYNC
+    mov word [rdi+8], ANY_MODIFIER
+    mov [rdi+10], bl                    ; key
+    mov byte [rdi+11], GRAB_MODE_ASYNC  ; pointer mode
+    mov byte [rdi+12], GRAB_MODE_ASYNC  ; keyboard mode
+    mov byte [rdi+13], 0
     mov word [rdi+14], 0
     lea rsi, [tmp_buf]
     mov rdx, 16
@@ -905,7 +1056,7 @@ event_loop:
     mov [last_x], ax
     movzx eax, word [cursor_y]
     mov [last_y], ax
-    call set_bounding_hole
+    call set_bounding_circle
     call x11_flush
     jmp .el_loop
 
@@ -947,15 +1098,13 @@ query_pointer_once_silent:
 ; cleanup — ungrab + destroy.
 ; ============================================================================
 cleanup:
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_UNGRAB_KEYBOARD
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 2
-    mov dword [rdi+4], 0
-    lea rsi, [tmp_buf]
-    mov rdx, 8
-    call x11_buffer
-    inc dword [x11_seq]
+    ; UngrabKey(root, ESC, AnyModifier)
+    push rbx
+    mov bl, KC_ESC
+    call .cu_ungrab
+    mov bl, KC_Q
+    call .cu_ungrab
+    pop rbx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_DESTROY_WINDOW
     mov byte [rdi+1], 0
@@ -970,6 +1119,20 @@ cleanup:
     mov rax, SYS_CLOSE
     mov rdi, [x11_fd]
     syscall
+    ret
+.cu_ungrab:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNGRAB_KEY
+    mov [rdi+1], bl                 ; keycode in opcode-data byte
+    mov word [rdi+2], 3             ; length 3 words
+    mov edx, [root_window]
+    mov [rdi+4], edx
+    mov word [rdi+8], ANY_MODIFIER
+    mov word [rdi+10], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    call x11_buffer
+    inc dword [x11_seq]
     ret
 
 ; ============================================================================
