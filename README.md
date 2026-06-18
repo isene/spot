@@ -7,19 +7,23 @@
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![Binary](https://img.shields.io/badge/binary-~14KB-orange)
+![Binary](https://img.shields.io/badge/binary-~22KB-orange)
 ![Startup](https://img.shields.io/badge/startup-~1ms-ff6600)
 ![Idle](https://img.shields.io/badge/idle%20cost-0%20W-brightgreen)
 ![Suite](https://img.shields.io/badge/suite-CHasm-9333ea)
 
-Presenter spotlight overlay for the [CHasm](https://github.com/isene/chasm)
-desktop suite. Darkens the whole screen, cuts a clean window around the
-mouse pointer. Works on every workspace and over screen-share (Teams,
-Discord, Meet capture the composited framebuffer, which includes us).
+Presenter overlays for the [CHasm](https://github.com/isene/chasm)
+desktop suite. Three modes from one binary: **spotlight** (dimmed
+screen, circular hole follows the cursor), **draw** (click-drag to
+annotate), **highlight** (click-drag a rectangle that stays bright
+while the surround stays dim). Works on every workspace and over
+screen-share (Teams, Discord, Meet capture the composited framebuffer,
+which includes us).
 
-Single static 14 KB ELF, no libc, pure x86_64 NASM. X11 wire protocol +
-SHAPE extension over a Unix socket. Zero idle cost: only runs when
-launched, exits cleanly on Esc.
+Single static ~21 KB ELF, no libc, pure x86_64 NASM. X11 wire protocol
++ SHAPE extension over a Unix socket. Every key passes through to the
+focused application — type, click, navigate slides while the overlay
+is up. Toggle via the launch key (a second press kills it).
 
 <br clear="left"/>
 
@@ -94,26 +98,32 @@ where windows below are updating; in that case, exit spot and re-launch.
 
 ## How it works
 
-- Override-redirect InputOutput window covers the root with a fill
-  computed from `SPOT_DIM`. The X server's free background fill does
-  the painting; no per-frame draw calls.
-- `SHAPE` extension, kind `Input`, rectangles `{}` → window has no input
-  region. All pointer events pass straight through. You can keep
-  interacting with the application underneath while the spotlight is up.
-- `SHAPE` extension, kind `Bounding`, ~564 per-row rectangles
-  approximating a circle of radius 140 px. The disk at the pointer is
-  excluded → underlying screen shows through.
-- A precomputed `circle_hw[]` table holds the circle's horizontal
-  half-width at every row (built in ~140 iterations at startup, then
-  static).
-- Cursor tracking polls `XQueryPointer` at 30 Hz. On actual motion
-  (delta ≥ 1 px), one `SHAPE Rectangles` request rewrites the bound.
-  Still cursor = zero requests, zero CPU.
-- Passive `GrabKey` on root for **Esc** and **q** (AnyModifier) so the
-  keys reach us regardless of input focus. Avoids the v0.1.0 issue where
-  `GrabKeyboard` on the freshly-mapped overlay window could race with
-  the X server's `MapNotify` and silently fail (`NotViewable`), leaving
-  Esc unbound.
+- **Snapshot pipeline**, shared by all three modes: `XGetImage` on root
+  at startup, walk every pixel through a 256-byte LUT that scales each
+  R/G/B channel by `(100 - SPOT_DIM) / 100`, `PutImage` the result into
+  a server-side pixmap. That pixmap becomes the overlay's
+  `CW_BACK_PIXMAP`, so the X server paints the surround for free.
+- **Override-redirect InputOutput window** covers the root. No window
+  manager involvement, no focus changes.
+- **Spotlight**: SHAPE input region empty (clicks pass through), SHAPE
+  bounding region = ~564 per-row rectangles approximating a circle of
+  radius 140 px. A precomputed `circle_hw[]` table holds the horizontal
+  half-width per row (built in ~140 iterations at startup, then static).
+  Cursor tracking polls `XQueryPointer` at 30 Hz; on actual motion one
+  `SHAPE Rectangles` request rewrites the bound. Still cursor = zero
+  requests, zero CPU.
+- **Draw**: GC on the pixmap with the user's colour, line-width, round
+  caps + joins. ButtonPress records the stroke origin; each Motion
+  event sends a `PolyLine` onto the pixmap and a `ClearArea` over the
+  segment's bounding box (padded for the round caps) to refresh just
+  that slice of the window.
+- **Highlight**: same pixmap, no input pass-through (we own the
+  pointer). Drag rectangles trigger four-rect SHAPE bounding updates —
+  top, bottom, left, right bars around the user's hole, live as you
+  drag.
+- **No keyboard grab.** Every key passes through to the focused
+  application underneath. The launch keybinding doubles as a kill —
+  `pkill -x spot || exec spot ...` toggles cleanly.
 
 ## Goals (CHasm rules in priority order)
 
