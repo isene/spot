@@ -2,7 +2,7 @@
 
 <img src="img/spot.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.2-blue)
+![Version](https://img.shields.io/badge/version-0.1.3-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -61,12 +61,16 @@ bind Mod4+Shift+s   exec spot
 bind Mod4+Shift+s   exec env SPOT_DIM=70 spot
 ```
 
-Honest caveat: the overlay is **opaque**, not transparent. Without a
-compositor, "dim" means "what colour the surround is painted." It does
-not show the content underneath darkened — the content is hidden. If
-you need true see-through dimming, you need an X compositor running
-(picom / xcompmgr); a future version may detect that and switch to an
-ARGB visual + RENDER blend.
+v0.1.3+ shows the **actual screen content darkened** (not a solid colour).
+At startup, spot does `XGetImage` on root, multiplies every R/G/B channel
+by `(100 - SPOT_DIM) / 100`, and uploads the result as the overlay's
+back pixmap. No compositor needed — the snapshot is just bytes on the
+server side, painted as the window background.
+
+Caveat: it's a **snapshot**. If something behind spot animates / scrolls
+/ repaints while spot is running, the dimmed surround stays as it was at
+startup. Fine for presenting static slides. Less great for live demos
+where windows below are updating; in that case, exit spot and re-launch.
 
 ## How it works
 

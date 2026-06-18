@@ -34,6 +34,12 @@ DEFAULT REL
 %define X11_CREATE_WINDOW       1
 %define X11_DESTROY_WINDOW      4
 %define X11_MAP_WINDOW          8
+%define X11_CREATE_PIXMAP       53
+%define X11_FREE_PIXMAP         54
+%define X11_CREATE_GC           55
+%define X11_FREE_GC             60
+%define X11_PUT_IMAGE           72
+%define X11_GET_IMAGE           73
 %define X11_GRAB_KEY            33
 %define X11_UNGRAB_KEY          34
 %define X11_QUERY_POINTER       38
@@ -47,6 +53,7 @@ DEFAULT REL
 %define EV_EXPOSE               12
 %define EV_MAP_NOTIFY           19
 
+%define CW_BACK_PIXMAP          0x0001
 %define CW_BACK_PIXEL           0x0002
 %define CW_OVERRIDE_REDIRECT    0x0200
 %define CW_EVENT_MASK           0x0800
@@ -103,7 +110,10 @@ overlay_win:         resd 1
 shape_major:         resb 1
 alignb 4
 dim_pct:             resd 1            ; SPOT_DIM env value, 0-100
-back_pixel:          resd 1            ; computed grayscale fill
+back_pixel:          resd 1            ; (kept for fallback; unused while snapshot path runs)
+snapshot_pixmap:     resd 1            ; XID of the dimmed-screen pixmap
+snapshot_gc:         resd 1            ; XID of the GC we use for PutImage
+dim_lut:             resb 256          ; per-channel byte → dimmed byte
 
 cursor_x:            resw 1
 cursor_y:            resw 1
@@ -122,6 +132,10 @@ tmp_buf:             resb 256
 ; bounds_buf holds the SHAPE_RECTANGLES request body. With ~280 rows
 ; producing 2 rects each plus 2 caps, worst case ≈ 16 + 564*8 ≈ 4.5 KB.
 bounds_buf:          resb 8192
+; snapshot_buf holds the dimmed root image we use as the overlay's back
+; pixmap. Sized for up to 4096×2160 × 4 bytes ≈ 35 MB. BSS is virtual
+; until written, so this costs nothing on smaller screens.
+snapshot_buf:        resb 4096 * 2160 * 4
 
 ; ============================================================================
 ; RODATA
@@ -161,6 +175,15 @@ _start:
     cmp byte [shape_major], 0
     je .die_shape
     call query_keymap               ; resolve XK_Escape/XK_q → real keycodes
+
+    ; Snapshot pipeline — capture root BEFORE creating our window so the
+    ; image doesn't include us. Dim in memory, upload as a server pixmap
+    ; that becomes the overlay's background.
+    call build_dim_lut
+    call take_root_snapshot
+    call dim_snapshot
+    call create_snapshot_pixmap
+    call upload_snapshot
 
     call grab_keys                  ; passive Esc/q grab on root FIRST
     call create_overlay
@@ -650,9 +673,9 @@ create_overlay:
     mov word [rdi+20], 0                ; border width
     mov word [rdi+22], INPUT_OUTPUT
     mov dword [rdi+24], COPY_FROM_PARENT ; visual
-    mov dword [rdi+28], CW_BACK_PIXEL | CW_OVERRIDE_REDIRECT | CW_EVENT_MASK
-    mov edx, [back_pixel]
-    mov [rdi+32], edx                   ; back pixel (computed from dim_pct)
+    mov dword [rdi+28], CW_BACK_PIXMAP | CW_OVERRIDE_REDIRECT | CW_EVENT_MASK
+    mov edx, [snapshot_pixmap]
+    mov [rdi+32], edx                   ; back pixmap = dimmed root snapshot
     mov dword [rdi+36], 1               ; override = true
     mov dword [rdi+40], EVMASK_KEY_PRESS | EVMASK_EXPOSURE | EVMASK_STRUCTURE
     lea rsi, [tmp_buf]
@@ -930,6 +953,242 @@ set_bounding_circle:
     syscall
     inc dword [x11_seq]
 
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; build_dim_lut — fill dim_lut[i] = i * (100 - dim_pct) / 100 for i in 0..255.
+; One 256-byte lookup beats 3 multiplies+divides per pixel × screen area.
+; ============================================================================
+build_dim_lut:
+    push rbx
+    mov ebx, 100
+    sub ebx, [dim_pct]              ; multiplier numerator
+    xor ecx, ecx
+.bdl_loop:
+    cmp ecx, 256
+    jge .bdl_done
+    mov eax, ecx
+    imul eax, ebx
+    xor edx, edx
+    mov edi, 100
+    div edi                         ; eax = i * num / 100
+    mov [dim_lut + rcx], al
+    inc ecx
+    jmp .bdl_loop
+.bdl_done:
+    pop rbx
+    ret
+
+; ============================================================================
+; take_root_snapshot — XGetImage(root, 0, 0, W, H, ZPixmap). Pulls the
+; pre-overlay screen contents into snapshot_buf. Pixel layout for the
+; common depth=24 case is BGRX little-endian, 4 bytes per pixel.
+; ============================================================================
+take_root_snapshot:
+    push rbx
+    push r12
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_IMAGE
+    mov byte [rdi+1], 2             ; format = ZPixmap
+    mov word [rdi+2], 5             ; length 5 words
+    mov edx, [root_window]
+    mov [rdi+4], edx
+    mov word [rdi+8], 0             ; x
+    mov word [rdi+10], 0            ; y
+    mov ax, [screen_w]
+    mov [rdi+12], ax
+    mov ax, [screen_h]
+    mov [rdi+14], ax
+    mov dword [rdi+16], 0xFFFFFFFF  ; plane-mask = all
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    ; Read 32-byte reply header
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .trs_done
+    cmp byte [read_buf], 1
+    jne .trs_done
+    mov eax, [read_buf + 4]         ; reply length in 4-byte units
+    shl eax, 2                      ; bytes
+    mov r12d, eax                   ; total body bytes
+    ; Drain into snapshot_buf
+    xor ebx, ebx
+.trs_drain:
+    cmp ebx, r12d
+    jge .trs_done
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [snapshot_buf]
+    add rsi, rbx
+    mov edx, r12d
+    sub edx, ebx
+    syscall
+    test rax, rax
+    jle .trs_done
+    add ebx, eax
+    jmp .trs_drain
+.trs_done:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; dim_snapshot — walk snapshot_buf as packed 4-byte pixels (BGRX), replacing
+; each of B, G, R with dim_lut[old]. The X byte (padding / alpha-ignored at
+; depth 24) is left alone — server discards it anyway.
+; ============================================================================
+dim_snapshot:
+    push rbx
+    push r12
+    push r13
+    movzx eax, word [screen_w]
+    movzx edx, word [screen_h]
+    imul rax, rdx
+    mov r13, rax                    ; pixel count
+    lea r12, [snapshot_buf]
+    xor rbx, rbx
+.ds_pix:
+    cmp rbx, r13
+    jge .ds_done
+    movzx eax, byte [r12]           ; B
+    mov al, [dim_lut + rax]
+    mov [r12], al
+    movzx eax, byte [r12 + 1]       ; G
+    mov al, [dim_lut + rax]
+    mov [r12 + 1], al
+    movzx eax, byte [r12 + 2]       ; R
+    mov al, [dim_lut + rax]
+    mov [r12 + 2], al
+    add r12, 4
+    inc rbx
+    jmp .ds_pix
+.ds_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; create_snapshot_pixmap — CreatePixmap(root, W, H, root_depth) and a GC for
+; subsequent PutImage uploads.
+; ============================================================================
+create_snapshot_pixmap:
+    push rbx
+    call alloc_xid
+    mov [snapshot_pixmap], eax
+    mov ebx, eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov al, [root_depth]
+    mov [rdi+1], al
+    mov word [rdi+2], 4
+    mov [rdi+4], ebx
+    mov edx, [root_window]
+    mov [rdi+8], edx
+    mov ax, [screen_w]
+    mov [rdi+12], ax
+    mov ax, [screen_h]
+    mov [rdi+14], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ; CreateGC on the pixmap (no value mask)
+    call alloc_xid
+    mov [snapshot_gc], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov [rdi+4], eax
+    mov [rdi+8], ebx                ; drawable = pixmap
+    mov dword [rdi+12], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; ============================================================================
+; upload_snapshot — PutImage chunks of up to 32 rows. Sends the 24-byte
+; PutImage header via SYS_WRITE, then the row bytes straight from
+; snapshot_buf without going through x11_buffer (avoids a 4-8 MB copy).
+; ============================================================================
+upload_snapshot:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    call x11_flush
+    movzx r12d, word [screen_w]
+    movzx r13d, word [screen_h]
+    xor r14d, r14d                  ; current row
+.us_chunk:
+    cmp r14d, r13d
+    jge .us_done
+    mov r15d, r13d
+    sub r15d, r14d
+    cmp r15d, 32
+    jle .us_rows_ok
+    mov r15d, 32
+.us_rows_ok:
+    ; data bytes for this chunk = rows * width * 4
+    mov eax, r15d
+    imul eax, r12d
+    shl eax, 2
+    mov ebx, eax                    ; data bytes (callee-saved)
+    ; request length in 4-byte units = (24 + data) / 4
+    add eax, 24
+    shr eax, 2
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_PUT_IMAGE
+    mov byte [rdi+1], 2             ; ZPixmap
+    mov word [rdi+2], ax
+    mov edx, [snapshot_pixmap]
+    mov [rdi+4], edx
+    mov edx, [snapshot_gc]
+    mov [rdi+8], edx
+    mov [rdi+12], r12w              ; width
+    mov [rdi+14], r15w              ; height
+    mov word [rdi+16], 0            ; dst-x
+    mov [rdi+18], r14w              ; dst-y
+    mov byte [rdi+20], 0            ; left-pad
+    mov al, [root_depth]
+    mov [rdi+21], al
+    mov word [rdi+22], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    syscall
+    ; Send body — offset = current_row * width * 4
+    mov eax, r14d
+    imul eax, r12d
+    shl eax, 2
+    mov rdx, rbx                    ; data bytes
+    lea rsi, [snapshot_buf]
+    add rsi, rax
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    add r14d, r15d
+    jmp .us_chunk
+.us_done:
     pop r15
     pop r14
     pop r13
