@@ -39,8 +39,9 @@ DEFAULT REL
 %define X11_QUERY_POINTER       38
 %define X11_QUERY_EXTENSION     98
 %define ANY_MODIFIER            0x8000
-%define KC_ESC                  9
-%define KC_Q                    24
+%define X11_GET_KEYBOARD_MAPPING 101
+%define XK_ESCAPE               0xFF1B
+%define XK_Q                    0x71
 
 %define EV_KEY_PRESS            2
 %define EV_EXPOSE               12
@@ -93,6 +94,10 @@ screen_h:            resw 1
 root_window:         resd 1
 root_visual:         resd 1
 root_depth:          resb 1
+min_keycode:         resb 1
+max_keycode:         resb 1
+esc_keycode:         resb 1
+q_keycode:           resb 1
 alignb 4
 overlay_win:         resd 1
 shape_major:         resb 1
@@ -155,6 +160,7 @@ _start:
     call query_shape
     cmp byte [shape_major], 0
     je .die_shape
+    call query_keymap               ; resolve XK_Escape/XK_q → real keycodes
 
     call grab_keys                  ; passive Esc/q grab on root FIRST
     call create_overlay
@@ -539,6 +545,13 @@ x11_parse_setup:
     mov [screen_w], ax
     mov ax, [rdx + 22]
     mov [screen_h], ax
+    ; min/max keycode are in the connection setup body at offsets 34/35
+    ; (relative to its start, which is conn_setup_buf + 8 because we read
+    ; the 8-byte success header into the same buffer).
+    movzx eax, byte [rsi + 34]
+    mov [min_keycode], al
+    movzx eax, byte [rsi + 35]
+    mov [max_keycode], al
     ret
 
 ; ============================================================================
@@ -925,6 +938,113 @@ set_bounding_circle:
     ret
 
 ; ============================================================================
+; query_keymap — GetKeyboardMapping for [min_keycode .. max_keycode], scan
+; the keysym body for XK_Escape (0xFF1B) and XK_q (0x71), populate the
+; *_keycode globals. v0.1.1 hard-coded kc=9/24 which is wrong on layouts
+; that remap (e.g. Norwegian/evdev pc105: Esc lands at keycode 66).
+; ============================================================================
+query_keymap:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    movzx ebx, byte [min_keycode]
+    movzx ecx, byte [max_keycode]
+    sub ecx, ebx
+    inc ecx                         ; count = max - min + 1
+    mov r12d, ecx                   ; r12 = keycode count
+
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_KEYBOARD_MAPPING
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], bl                 ; first_keycode
+    mov [rdi+5], cl                 ; count
+    mov word [rdi+6], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+
+    ; Read 32-byte reply header.
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .qk_done
+    cmp byte [read_buf], 1          ; type 1 = Reply
+    jne .qk_done
+    movzx r13d, byte [read_buf + 1] ; keysyms per keycode
+    test r13d, r13d
+    jz .qk_done
+    mov eax, [read_buf + 4]         ; body length in 4-byte units
+    shl eax, 2                      ; bytes
+    mov r14d, eax                   ; total body bytes
+
+    ; Drain the body into conn_setup_buf (already large enough).
+    xor r15d, r15d
+.qk_drain:
+    cmp r15d, r14d
+    jge .qk_drained
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [conn_setup_buf]
+    add rsi, r15
+    mov edx, r14d
+    sub edx, r15d
+    syscall
+    test rax, rax
+    jle .qk_drained
+    add r15d, eax
+    jmp .qk_drain
+.qk_drained:
+
+    ; Scan: for each keycode i in [0 .. count) and slot in [0 .. keysyms_per_kc),
+    ; check keysym at body + (i * keysyms_per_kc + slot) * 4.
+    xor ecx, ecx                    ; i
+.qk_loop_i:
+    cmp ecx, r12d
+    jge .qk_done
+    xor edx, edx                    ; slot
+.qk_loop_s:
+    cmp edx, r13d
+    jge .qk_next_i
+    mov eax, ecx
+    imul eax, r13d
+    add eax, edx
+    shl eax, 2                      ; byte offset
+    mov eax, [conn_setup_buf + rax]
+    cmp eax, XK_ESCAPE
+    jne .qk_not_esc
+    mov edi, ebx
+    add edi, ecx
+    mov [esc_keycode], dil
+    jmp .qk_advance_s
+.qk_not_esc:
+    cmp eax, XK_Q
+    jne .qk_advance_s
+    mov edi, ebx
+    add edi, ecx
+    mov [q_keycode], dil
+.qk_advance_s:
+    inc edx
+    jmp .qk_loop_s
+.qk_next_i:
+    inc ecx
+    jmp .qk_loop_i
+.qk_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
 ; grab_keys — passive GrabKey on root for Esc and q with AnyModifier. These
 ; grabs trigger an active grab on press → events route to us regardless of
 ; current input focus, so Esc always works even while no window owns focus.
@@ -933,10 +1053,16 @@ set_bounding_circle:
 ; ============================================================================
 grab_keys:
     push rbx
-    mov bl, KC_ESC
+    mov bl, [esc_keycode]
+    test bl, bl
+    jz .gk_skip_esc
     call .gk_one
-    mov bl, KC_Q
+.gk_skip_esc:
+    mov bl, [q_keycode]
+    test bl, bl
+    jz .gk_skip_q
     call .gk_one
+.gk_skip_q:
     pop rbx
     ret
 .gk_one:
@@ -1035,9 +1161,11 @@ event_loop:
 
 .el_keypress:
     movzx eax, byte [read_buf + 1]
-    cmp eax, 9                      ; Esc (standard kc on Linux X11)
+    movzx ecx, byte [esc_keycode]
+    cmp eax, ecx
     je .el_exit
-    cmp eax, 24                     ; q
+    movzx ecx, byte [q_keycode]
+    cmp eax, ecx
     je .el_exit
     jmp .el_loop
 
@@ -1098,12 +1226,19 @@ query_pointer_once_silent:
 ; cleanup — ungrab + destroy.
 ; ============================================================================
 cleanup:
-    ; UngrabKey(root, ESC, AnyModifier)
+    ; UngrabKey(root, Esc/q, AnyModifier) using the dynamically-resolved
+    ; keycodes from query_keymap. Skip when 0 (grab never installed).
     push rbx
-    mov bl, KC_ESC
+    mov bl, [esc_keycode]
+    test bl, bl
+    jz .cu_skip_esc
     call .cu_ungrab
-    mov bl, KC_Q
+.cu_skip_esc:
+    mov bl, [q_keycode]
+    test bl, bl
+    jz .cu_skip_q
     call .cu_ungrab
+.cu_skip_q:
     pop rbx
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_DESTROY_WINDOW
