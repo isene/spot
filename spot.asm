@@ -44,6 +44,8 @@ DEFAULT REL
 %define X11_FREE_PIXMAP         54
 %define X11_CREATE_GC           55
 %define X11_FREE_GC             60
+%define X11_CLEAR_AREA          61
+%define X11_POLY_LINE           65
 %define X11_PUT_IMAGE           72
 %define X11_GET_IMAGE           73
 %define X11_GRAB_KEY            33
@@ -56,8 +58,24 @@ DEFAULT REL
 %define XK_Q                    0x71
 
 %define EV_KEY_PRESS            2
+%define EV_BUTTON_PRESS         4
+%define EV_BUTTON_RELEASE       5
+%define EV_MOTION_NOTIFY        6
 %define EV_EXPOSE               12
 %define EV_MAP_NOTIFY           19
+
+%define EVMASK_BUTTON_PRESS     0x0004
+%define EVMASK_BUTTON_RELEASE   0x0008
+%define EVMASK_BUTTON1_MOTION   0x0100
+
+; GC value bits
+%define GC_FOREGROUND           0x00000004
+%define GC_LINE_WIDTH           0x00000010
+%define GC_CAP_STYLE            0x00000040
+%define GC_JOIN_STYLE           0x00000080
+%define CAP_ROUND               2
+%define JOIN_ROUND              1
+%define COORD_MODE_ORIGIN       0
 
 %define CW_BACK_PIXMAP          0x0001
 %define CW_BACK_PIXEL           0x0002
@@ -83,6 +101,8 @@ DEFAULT REL
 ; ---- Layout ----------------------------------------------------------------
 %define SPOT_RADIUS             140       ; spotlight radius in px
 %define DEFAULT_DIM             80        ; 0=white, 100=black; default ≈ #333333
+%define DEFAULT_COLOR           0x00FF0000 ; draw stroke colour (red)
+%define DEFAULT_WIDTH           3          ; stroke line width in px
 
 ; ============================================================================
 ; BSS
@@ -127,6 +147,17 @@ last_x:              resw 1
 last_y:              resw 1
 start_sec:           resq 1            ; CLOCK_MONOTONIC seconds at startup
 
+; Draw mode state
+draw_mode:           resb 1            ; 1 if `spot draw`, 0 if spotlight
+alignb 4
+draw_color:          resd 1            ; SPOT_COLOR env (24-bit RGB)
+draw_width:          resd 1            ; SPOT_WIDTH env (pixels)
+draw_gc:             resd 1            ; GC for stroke drawing
+draw_x:              resw 1            ; previous stroke point
+draw_y:              resw 1
+drawing:             resb 1            ; 1 while a button is held
+alignb 4
+
 ; circle_hw[i] = floor(sqrt(R² - i²)), for i in 0..R inclusive
 circle_hw:           resw SPOT_RADIUS + 1
 
@@ -169,10 +200,22 @@ _start:
     mov rax, [rsp]                  ; argc
     lea rcx, [rsp + 8 + rax*8 + 8]  ; envp
     mov [envp], rcx
+    ; argv[1] = "draw" → draw mode. Otherwise spotlight.
+    cmp rax, 2
+    jl .skip_draw_check
+    mov rcx, [rsp + 16]             ; argv[1]
+    cmp dword [rcx], 'draw'
+    jne .skip_draw_check
+    cmp byte [rcx + 4], 0
+    jne .skip_draw_check
+    mov byte [draw_mode], 1
+.skip_draw_check:
 
     call parse_display
     call read_xauthority
     call parse_dim
+    call parse_color
+    call parse_width
     call build_circle_table
     call x11_connect
     test rax, rax
@@ -190,12 +233,27 @@ _start:
     ; Snapshot pipeline — capture root BEFORE creating our window so the
     ; image doesn't include us. Dim in memory, upload as a server pixmap
     ; that becomes the overlay's background.
+    ; In draw mode, force no dim — user wants to see content clearly.
+    cmp byte [draw_mode], 0
+    je .keep_dim
+    mov dword [dim_pct], 0
+.keep_dim:
     call build_dim_lut
     call take_root_snapshot
     call dim_snapshot
     call create_snapshot_pixmap
     call upload_snapshot
 
+    cmp byte [draw_mode], 0
+    je .spotlight_setup
+    ; Draw mode setup: GC on the pixmap, overlay listens for buttons.
+    call create_draw_gc
+    call create_overlay             ; event mask picks up draw_mode
+    call x11_flush
+    call event_loop
+    jmp .done
+
+.spotlight_setup:
     call create_overlay
     call set_input_passthrough
     call x11_flush
@@ -204,6 +262,7 @@ _start:
     call x11_flush
 
     call event_loop
+.done:
     call cleanup
     xor edi, edi
     mov rax, SYS_EXIT
@@ -687,7 +746,13 @@ create_overlay:
     mov edx, [snapshot_pixmap]
     mov [rdi+32], edx                   ; back pixmap = dimmed root snapshot
     mov dword [rdi+36], 1               ; override = true
-    mov dword [rdi+40], EVMASK_KEY_PRESS | EVMASK_EXPOSURE | EVMASK_STRUCTURE
+    ; Event mask varies by mode: draw mode also takes button + motion events.
+    mov edx, EVMASK_KEY_PRESS | EVMASK_EXPOSURE | EVMASK_STRUCTURE
+    cmp byte [draw_mode], 0
+    je .co_mask_done
+    or edx, EVMASK_BUTTON_PRESS | EVMASK_BUTTON_RELEASE | EVMASK_BUTTON1_MOTION
+.co_mask_done:
+    mov [rdi+40], edx
     lea rsi, [tmp_buf]
     mov rdx, 44
     call x11_buffer
@@ -971,6 +1036,98 @@ set_bounding_circle:
     ret
 
 ; ============================================================================
+; parse_color — read SPOT_COLOR=RRGGBB (or #RRGGBB) from envp into draw_color.
+; ============================================================================
+parse_color:
+    mov dword [draw_color], DEFAULT_COLOR
+    mov rcx, [envp]
+.pc_loop:
+    mov rdi, [rcx]
+    test rdi, rdi
+    jz .pc_done
+    cmp dword [rdi], 'SPOT'
+    jne .pc_next
+    cmp dword [rdi+4], '_COL'
+    jne .pc_next
+    cmp word  [rdi+8], 'OR'
+    jne .pc_next
+    cmp byte  [rdi+10], '='
+    jne .pc_next
+    add rdi, 11
+    cmp byte [rdi], '#'
+    jne .pc_parse
+    inc rdi
+.pc_parse:
+    xor eax, eax
+    mov ecx, 6
+.pc_hex:
+    movzx edx, byte [rdi]
+    sub edx, '0'
+    cmp edx, 9
+    jbe .pc_digit
+    sub edx, 'A' - '0' - 10
+    cmp edx, 15
+    jbe .pc_digit
+    sub edx, 'a' - 'A'
+    cmp edx, 15
+    ja .pc_done
+.pc_digit:
+    shl eax, 4
+    or eax, edx
+    inc rdi
+    dec ecx
+    jnz .pc_hex
+    mov [draw_color], eax
+    jmp .pc_done
+.pc_next:
+    add rcx, 8
+    jmp .pc_loop
+.pc_done:
+    ret
+
+; ============================================================================
+; parse_width — read SPOT_WIDTH from envp into draw_width.
+; ============================================================================
+parse_width:
+    mov dword [draw_width], DEFAULT_WIDTH
+    mov rcx, [envp]
+.pw_loop:
+    mov rdi, [rcx]
+    test rdi, rdi
+    jz .pw_done
+    cmp dword [rdi], 'SPOT'
+    jne .pw_next
+    cmp dword [rdi+4], '_WID'
+    jne .pw_next
+    cmp word  [rdi+8], 'TH'
+    jne .pw_next
+    cmp byte  [rdi+10], '='
+    jne .pw_next
+    add rdi, 11
+    xor eax, eax
+.pw_digit:
+    movzx edx, byte [rdi]
+    sub edx, '0'
+    cmp edx, 9
+    ja .pw_save
+    imul eax, eax, 10
+    add eax, edx
+    cmp eax, 1000
+    jg .pw_done
+    inc rdi
+    jmp .pw_digit
+.pw_save:
+    test eax, eax
+    jz .pw_done
+    mov [draw_width], eax
+    jmp .pw_done
+.pw_next:
+    add rcx, 8
+    jmp .pw_loop
+.pw_done:
+    ret
+
+; ============================================================================
 ; build_dim_lut — fill dim_lut[i] = i * (100 - dim_pct) / 100 for i in 0..255.
 ; One 256-byte lookup beats 3 multiplies+divides per pixel × screen area.
 ; ============================================================================
@@ -1203,6 +1360,120 @@ upload_snapshot:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; create_draw_gc — GC on the snapshot pixmap with the user's colour, width,
+; and round caps/joins (so strokes look hand-drawn, not boxy).
+; ============================================================================
+create_draw_gc:
+    push rbx
+    call alloc_xid
+    mov [draw_gc], eax
+    mov ebx, eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 8             ; len = 4 header + 4 values
+    mov [rdi+4], ebx
+    mov edx, [snapshot_pixmap]
+    mov [rdi+8], edx
+    mov dword [rdi+12], GC_FOREGROUND | GC_LINE_WIDTH | GC_CAP_STYLE | GC_JOIN_STYLE
+    mov edx, [draw_color]
+    mov [rdi+16], edx               ; foreground
+    mov edx, [draw_width]
+    mov [rdi+20], edx               ; line-width
+    mov dword [rdi+24], CAP_ROUND   ; cap-style
+    mov dword [rdi+28], JOIN_ROUND  ; join-style
+    lea rsi, [tmp_buf]
+    mov rdx, 32
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; ============================================================================
+; draw_segment — PolyLine from (draw_x, draw_y) to (cursor_x, cursor_y) onto
+; the snapshot pixmap, then ClearArea on the window to refresh the affected
+; rectangle. cursor_x / cursor_y here are the latest button-motion coords
+; (the event_loop loads them from the X event).
+; ============================================================================
+draw_segment:
+    push rbx
+    ; PolyLine on the pixmap with 2 points
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_LINE
+    mov byte [rdi+1], COORD_MODE_ORIGIN
+    mov word [rdi+2], 5             ; 3 header + 2 points = 5 words
+    mov edx, [snapshot_pixmap]
+    mov [rdi+4], edx
+    mov edx, [draw_gc]
+    mov [rdi+8], edx
+    movzx eax, word [draw_x]
+    mov [rdi+12], ax
+    movzx eax, word [draw_y]
+    mov [rdi+14], ax
+    movzx eax, word [cursor_x]
+    mov [rdi+16], ax
+    movzx eax, word [cursor_y]
+    mov [rdi+18], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    ; ClearArea on the overlay window over the segment's bounding box,
+    ; padded by line-width to catch round caps.
+    movzx eax, word [draw_x]
+    movzx ecx, word [cursor_x]
+    cmp eax, ecx
+    jle .ds_x_ok
+    xchg eax, ecx
+.ds_x_ok:
+    mov ebx, eax                    ; min_x
+    sub ecx, eax                    ; w = max_x - min_x
+    mov r8d, [draw_width]
+    add r8d, 4
+    sub ebx, r8d                    ; pad start
+    js .ds_x_clamp
+    jmp .ds_x_size
+.ds_x_clamp:
+    xor ebx, ebx
+.ds_x_size:
+    add ecx, r8d
+    add ecx, r8d                    ; width = (max-min) + 2*pad
+    mov r9d, ecx                    ; width
+    movzx eax, word [draw_y]
+    movzx ecx, word [cursor_y]
+    cmp eax, ecx
+    jle .ds_y_ok
+    xchg eax, ecx
+.ds_y_ok:
+    mov r10d, eax                   ; min_y
+    sub ecx, eax
+    sub r10d, r8d
+    js .ds_y_clamp
+    jmp .ds_y_size
+.ds_y_clamp:
+    xor r10d, r10d
+.ds_y_size:
+    add ecx, r8d
+    add ecx, r8d                    ; height
+    mov r11d, ecx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CLEAR_AREA
+    mov byte [rdi+1], 0             ; exposures = false
+    mov word [rdi+2], 4             ; len 4 words
+    mov edx, [overlay_win]
+    mov [rdi+4], edx
+    mov [rdi+8], bx                 ; x
+    mov [rdi+10], r10w              ; y
+    mov [rdi+12], r9w               ; w
+    mov [rdi+14], r11w              ; h
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
     pop rbx
     ret
 
@@ -1524,12 +1795,54 @@ event_loop:
     lea rsi, [read_buf]
     mov rdx, 32
     syscall
-    ; v0.1.5: we don't grab keys; any X event we read is uninteresting
-    ; (it's almost always replies/errors we never queue answers for).
-    ; Just drain and continue. SIGTERM is the exit path.
+    cmp rax, 32
+    jl .el_loop
+    cmp byte [draw_mode], 0
+    je .el_loop                      ; spotlight: drain & ignore
+    ; Draw mode dispatch — pointer events drive the stroke.
+    movzx eax, byte [read_buf]
+    and eax, 0x7F
+    cmp eax, EV_BUTTON_PRESS
+    je .el_btn_press
+    cmp eax, EV_BUTTON_RELEASE
+    je .el_btn_release
+    cmp eax, EV_MOTION_NOTIFY
+    je .el_motion
+    jmp .el_loop
+
+.el_btn_press:
+    movzx eax, word [read_buf + 24]  ; event_x
+    mov [draw_x], ax
+    mov [cursor_x], ax               ; cursor_* reused as "latest point"
+    movzx eax, word [read_buf + 26]  ; event_y
+    mov [draw_y], ax
+    mov [cursor_y], ax
+    mov byte [drawing], 1
+    jmp .el_loop
+
+.el_btn_release:
+    mov byte [drawing], 0
+    jmp .el_loop
+
+.el_motion:
+    cmp byte [drawing], 0
+    je .el_loop
+    movzx eax, word [read_buf + 24]
+    mov [cursor_x], ax
+    movzx eax, word [read_buf + 26]
+    mov [cursor_y], ax
+    call draw_segment
+    call x11_flush
+    movzx eax, word [cursor_x]
+    mov [draw_x], ax
+    movzx eax, word [cursor_y]
+    mov [draw_y], ax
     jmp .el_loop
 
 .el_tick:
+    ; Tick path is only useful in spotlight mode (cursor-follow redraw).
+    cmp byte [draw_mode], 0
+    jne .el_loop
     call query_pointer_once_silent
     movzx eax, word [cursor_x]
     movzx ecx, word [last_x]

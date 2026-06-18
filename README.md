@@ -2,7 +2,7 @@
 
 <img src="img/spot.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.5-blue)
+![Version](https://img.shields.io/badge/version-0.2.0-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -27,9 +27,9 @@ launched, exits cleanly on Esc.
 
 | Mode | Status | Bound to |
 |------|--------|----------|
-| **spotlight** | ✓ shipped | `Mod4+Shift+s` (tile) |
+| **spotlight** | ✓ shipped (v0.1.0) | `Mod4+Shift+s` (tile) |
+| **draw** (annotate) | ✓ shipped (v0.2.0) | `Mod4+Shift+d` (tile) |
 | **highlight** (drag-rect) | planned | `Mod4+Shift+h` |
-| **draw** (annotate) | planned | `Mod4+Shift+d` |
 
 ## Install
 
@@ -40,15 +40,30 @@ make
 sudo make install
 ```
 
-Add a toggle binding to `~/.tilerc` (same key launches and kills):
+Add toggle bindings to `~/.tilerc` (same key launches and kills):
 
 ```
 bind Mod4+Shift+s   exec sh -c 'pkill -x spot || exec spot'
+bind Mod4+Shift+d   exec sh -c 'pkill -x spot || exec spot draw'
 ```
 
-First press launches spot; second press kills it. Esc and q pass through
-to whatever application has focus — type into the terminal, click in the
-slides, anything underneath stays interactive while the spotlight is up.
+First press launches spot; second press kills it. Esc and every other
+key passes through to whatever application has focus in **spotlight**
+mode — type into the terminal, click in the slides, anything underneath
+stays interactive while the spotlight is up.
+
+In **draw** mode, click-drag draws strokes onto a frozen snapshot of the
+screen. Configure colour and width via env vars:
+
+```
+bind Mod4+Shift+d   exec sh -c 'pkill -x spot || env SPOT_COLOR=00cc44 SPOT_WIDTH=5 exec spot draw'
+```
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `SPOT_DIM`   | `80`     | spotlight surround brightness (0-100) |
+| `SPOT_COLOR` | `ff0000` | draw stroke colour (hex `RRGGBB`, optional `#`) |
+| `SPOT_WIDTH` | `3`      | draw stroke width in pixels |
 
 ## Configuration
 
