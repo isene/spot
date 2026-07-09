@@ -2,25 +2,26 @@
 
 <img src="img/spot.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.3.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.1-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![Binary](https://img.shields.io/badge/binary-~22KB-orange)
+![Binary](https://img.shields.io/badge/binary-~24KB-orange)
 ![Startup](https://img.shields.io/badge/startup-~1ms-ff6600)
 ![Idle](https://img.shields.io/badge/idle%20cost-0%20W-brightgreen)
 ![Suite](https://img.shields.io/badge/suite-CHasm-9333ea)
 
 Presenter overlays for the [CHasm](https://github.com/isene/chasm)
-desktop suite. Three modes from one binary: **spotlight** (dimmed
+desktop suite. Four modes from one binary: **spotlight** (dimmed
 screen, circular hole follows the cursor), **draw** (click-drag to
 annotate), **highlight** (click-drag a rectangle that stays bright
-while the surround stays dim). Works on every workspace and over
-screen-share (Teams, Discord, Meet capture the composited framebuffer,
-which includes us).
+while the surround stays dim), **ocr** (drag a rectangle over any
+on-screen text — even unselectable GUI text — and get it on the
+clipboard). Works on every workspace and over screen-share (Teams,
+Discord, Meet capture the composited framebuffer, which includes us).
 
-Single static ~21 KB ELF, no libc, pure x86_64 NASM. X11 wire protocol
+Single static ~24 KB ELF, no libc, pure x86_64 NASM. X11 wire protocol
 + SHAPE extension over a Unix socket. Every key passes through to the
 focused application — type, click, navigate slides while the overlay
 is up. Toggle via the launch key (a second press kills it).
@@ -34,6 +35,7 @@ is up. Toggle via the launch key (a second press kills it).
 | **spotlight** | ✓ shipped (v0.1.0) | `Mod4+Shift+s` (tile) |
 | **draw** (annotate) | ✓ shipped (v0.2.0) | `Mod4+Shift+d` (tile) |
 | **highlight** (drag-rect) | ✓ shipped (v0.3.0) | `Mod4+Shift+h` (tile) |
+| **ocr** (text grab) | ✓ shipped (v0.3.1) | `Mod4+Shift+t` (tile) |
 
 ## Install
 
@@ -50,6 +52,7 @@ Add toggle bindings to `~/.tilerc` (same key launches and kills):
 bind Mod4+Shift+s   exec sh -c 'pkill -x spot || exec spot'
 bind Mod4+Shift+d   exec sh -c 'pkill -x spot || exec spot draw'
 bind Mod4+Shift+h   exec sh -c 'pkill -x spot || exec spot highlight'
+bind Mod4+Shift+t   exec sh -c 'pkill -x spot || exec spot ocr'
 ```
 
 First press launches spot; second press kills it. Esc and every other
@@ -69,6 +72,14 @@ bind Mod4+Shift+d   exec sh -c 'pkill -x spot || env SPOT_COLOR=00cc44 SPOT_WIDT
 | `SPOT_DIM`   | `80`     | spotlight surround brightness (0-100) |
 | `SPOT_COLOR` | `ff0000` | draw stroke colour (hex `RRGGBB`, optional `#`) |
 | `SPOT_WIDTH` | `3`      | draw stroke width in pixels |
+
+In **ocr** mode, drag a rectangle over any on-screen text and release:
+the region is OCR'd and the text lands on the clipboard. This works on
+text X11 cannot select — GUI button labels, browser tab titles, text in
+images. Needs `tesseract-ocr` and `xclip` installed (runtime only, and
+only for this mode). Accuracy is best on prose; short non-dictionary
+strings (prompts, identifiers) may misread. Include the full glyphs in
+the rectangle — clipped edge characters misread.
 
 ## Configuration
 
@@ -121,6 +132,11 @@ where windows below are updating; in that case, exit spot and re-launch.
   pointer). Drag rectangles trigger four-rect SHAPE bounding updates —
   top, bottom, left, right bars around the user's hole, live as you
   drag.
+- **OCR**: highlight's drag UI, but an undimmed copy of the snapshot
+  is kept at startup. On release, the selected rectangle is written as
+  a PPM — 3× nearest-neighbour upscale, auto-inverted when the region
+  is dark (tesseract wants dark-on-light) — then a forked child runs
+  `tesseract | xclip` and spot exits immediately.
 - **No keyboard grab.** Every key passes through to the focused
   application underneath. The launch keybinding doubles as a kill —
   `pkill -x spot || exec spot ...` toggles cleanly.

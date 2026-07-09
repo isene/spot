@@ -22,6 +22,8 @@ DEFAULT REL
 %define SYS_OPEN        2
 %define SYS_CLOSE       3
 %define SYS_POLL        7
+%define SYS_FORK        57
+%define SYS_EXECVE      59
 %define SYS_EXIT        60
 %define SYS_SOCKET      41
 %define SYS_CONNECT     42
@@ -181,6 +183,14 @@ bounds_buf:          resb 8192
 ; until written, so this costs nothing on smaller screens.
 snapshot_buf:        resb 4096 * 2160 * 4
 
+; OCR mode state. orig_buf keeps the UNDIMMED root snapshot (dim_snapshot
+; dims snapshot_buf in place; tesseract needs clean pixels). Virtual-only
+; cost — the pages materialize only when ocr mode copies into them.
+ocr_mode:            resb 1            ; 1 if `spot ocr`
+ocr_invert:          resb 1            ; 0xFF = dark background, invert bytes
+orig_buf:            resb 4096 * 2160 * 4
+ocr_row:             resb 4096 * 9 + 32 ; one PPM RGB row at 3x (+ header)
+
 ; ============================================================================
 ; RODATA
 ; ============================================================================
@@ -195,6 +205,16 @@ err_connect:         db "spot: X11 connect failed", 10
 err_connect_len equ $ - err_connect
 err_shape:           db "spot: SHAPE extension missing", 10
 err_shape_len equ $ - err_shape
+
+; OCR: the captured rect goes to a PPM; a forked shell runs tesseract and
+; pipes the text into the CLIPBOARD via xclip (both system binaries; this
+; only ever runs on an explicit user drag — zero idle cost).
+ocr_ppm_path:        db "/tmp/spot-ocr.ppm", 0
+ocr_sh:              db "/bin/sh", 0
+ocr_dash_c:          db "-c", 0
+ocr_cmd:             db "tesseract /tmp/spot-ocr.ppm - --psm 6 2>/dev/null | xclip -selection clipboard -in; rm -f /tmp/spot-ocr.ppm", 0
+align 8
+ocr_argv:            dq ocr_sh, ocr_dash_c, ocr_cmd, 0
 
 ; ============================================================================
 ; TEXT
@@ -219,7 +239,7 @@ _start:
     jmp .skip_mode_check
 .check_highlight:
     cmp dword [rcx], 'high'
-    jne .skip_mode_check
+    jne .check_ocr
     cmp dword [rcx + 4], 'ligh'
     jne .skip_mode_check
     ; bytes 8-9 must be 't' then NUL
@@ -228,6 +248,13 @@ _start:
     cmp byte [rcx + 9], 0
     jne .skip_mode_check
     mov byte [highlight_mode], 1
+    jmp .skip_mode_check
+.check_ocr:
+    ; "ocr" + NUL fits one dword ('o','c','r',0 little-endian)
+    cmp dword [rcx], 'ocr'
+    jne .skip_mode_check
+    mov byte [ocr_mode], 1
+    mov byte [highlight_mode], 1    ; ocr rides the highlight drag UX
 .skip_mode_check:
 
     call parse_display
@@ -259,6 +286,16 @@ _start:
 .keep_dim:
     call build_dim_lut
     call take_root_snapshot
+    ; OCR needs the clean pre-dim pixels — dim_snapshot dims in place.
+    cmp byte [ocr_mode], 0
+    je .no_ocr_copy
+    movzx eax, word [screen_w]
+    movzx ecx, word [screen_h]
+    imul ecx, eax                   ; pixel count
+    lea rsi, [snapshot_buf]
+    lea rdi, [orig_buf]
+    rep movsd
+.no_ocr_copy:
     call dim_snapshot
     call create_snapshot_pixmap
     call upload_snapshot
@@ -636,6 +673,185 @@ itoa_in_place:
     dec rsi
     jmp .iip_rev
 .iip_rev_done:
+    ret
+
+; ============================================================================
+; ocr_capture — write the dragged rect (hl_* coords) from the UNDIMMED
+; orig_buf as a P6 PPM to /tmp/spot-ocr.ppm, then fork
+; `sh -c "tesseract … | xclip"` so the recognized text lands in the
+; CLIPBOARD. Runs once, on ButtonRelease in ocr mode; the parent returns
+; and spot exits while the child OCRs in the background.
+; ============================================================================
+ocr_capture:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    ; Normalize the drag rect: r12=x1 r13=y1 r14=w r15=h.
+    movzx eax, word [hl_x1]
+    movzx ecx, word [hl_x2]
+    cmp eax, ecx
+    jle .oc_x_ok
+    xchg eax, ecx
+.oc_x_ok:
+    mov r12d, eax
+    sub ecx, eax
+    mov r14d, ecx
+    movzx eax, word [hl_y1]
+    movzx ecx, word [hl_y2]
+    cmp eax, ecx
+    jle .oc_y_ok
+    xchg eax, ecx
+.oc_y_ok:
+    mov r13d, eax
+    sub ecx, eax
+    mov r15d, ecx
+    cmp r14d, 2                     ; degenerate drag → nothing to OCR
+    jl .oc_done
+    cmp r15d, 2
+    jl .oc_done
+    ; Auto-invert probe: tesseract wants dark-on-light; terminals are the
+    ; opposite. Mean green channel over the rect < 110 → dark background →
+    ; invert every byte during the swizzle.
+    mov byte [ocr_invert], 0
+    xor r8d, r8d                    ; luminance sum
+    xor r9d, r9d                    ; pixel count
+    xor ebp, ebp                    ; row
+.oc_probe_row:
+    cmp ebp, r15d
+    jge .oc_probe_done
+    movzx eax, word [screen_w]
+    mov ecx, r13d
+    add ecx, ebp
+    imul eax, ecx
+    add eax, r12d
+    lea rsi, [orig_buf + rax*4]
+    mov ecx, r14d
+.oc_probe_px:
+    movzx eax, byte [rsi + 1]       ; G ≈ luminance
+    add r8d, eax
+    inc r9d
+    add rsi, 4
+    dec ecx
+    jnz .oc_probe_px
+    inc ebp
+    jmp .oc_probe_row
+.oc_probe_done:
+    mov eax, r8d
+    xor edx, edx
+    div r9d                         ; mean
+    cmp eax, 110
+    jge .oc_no_invert
+    mov byte [ocr_invert], 0xFF
+.oc_no_invert:
+    ; /tmp/spot-ocr.ppm  O_WRONLY|O_CREAT|O_TRUNC, 0600
+    mov rax, SYS_OPEN
+    lea rdi, [ocr_ppm_path]
+    mov esi, 0x241
+    mov edx, 0x180
+    syscall
+    test rax, rax
+    js .oc_done
+    mov ebx, eax                    ; fd
+    ; Header "P6\n<w*3> <h*3>\n255\n" — the image is upscaled 3x
+    ; (nearest-neighbor) because tesseract's accuracy on 1x screen-size
+    ; glyphs is poor; ~3x approximates the 300 dpi it was trained for.
+    lea rdi, [ocr_row]
+    mov word [rdi], 'P6'
+    mov byte [rdi + 2], 10
+    add rdi, 3
+    lea rax, [r14 + r14*2]
+    call itoa_in_place
+    mov byte [rdi], ' '
+    inc rdi
+    lea rax, [r15 + r15*2]
+    call itoa_in_place
+    mov byte [rdi], 10
+    mov dword [rdi + 1], 0x0A353532 ; "255\n"
+    add rdi, 5
+    lea rsi, [ocr_row]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rdi, rbx
+    mov rax, SYS_WRITE
+    syscall
+    ; Rows: swizzle BGRX → RGB into ocr_row, one write(2) per row. Row
+    ; count ≤ screen height and this runs once per user drag — the
+    ; syscall count is irrelevant here.
+    xor ebp, ebp                    ; row
+.oc_row_loop:
+    cmp ebp, r15d
+    jge .oc_rows_done
+    movzx eax, word [screen_w]      ; src = orig_buf + ((y1+row)*W + x1)*4
+    mov ecx, r13d
+    add ecx, ebp
+    imul eax, ecx
+    add eax, r12d
+    lea rsi, [orig_buf + rax*4]
+    lea rdi, [ocr_row]
+    mov ecx, r14d
+    mov dl, [ocr_invert]            ; 0x00 pass-through / 0xFF invert
+.oc_px:
+    mov al, [rsi + 2]               ; R (buffer is BGRX little-endian)
+    xor al, dl
+    mov [rdi], al
+    mov [rdi + 3], al               ; 3x horizontal (nearest-neighbor)
+    mov [rdi + 6], al
+    mov al, [rsi + 1]               ; G
+    xor al, dl
+    mov [rdi + 1], al
+    mov [rdi + 4], al
+    mov [rdi + 7], al
+    mov al, [rsi]                   ; B
+    xor al, dl
+    mov [rdi + 2], al
+    mov [rdi + 5], al
+    mov [rdi + 8], al
+    add rsi, 4
+    add rdi, 9
+    dec ecx
+    jnz .oc_px
+    ; 3x vertical: write the scaled row three times.
+    mov ecx, 3
+.oc_row_write:
+    push rcx
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [ocr_row]
+    imul edx, r14d, 9               ; w * 3px * 3bytes
+    syscall
+    pop rcx
+    dec ecx
+    jnz .oc_row_write
+    inc ebp
+    jmp .oc_row_loop
+.oc_rows_done:
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    ; Hand off: fork; the child execs sh -c "tesseract | xclip". The
+    ; child inherits our env (DISPLAY for xclip). Parent returns → exit.
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jnz .oc_done                    ; parent (or fork failure)
+    lea rdi, [ocr_sh]
+    lea rsi, [ocr_argv]
+    mov rdx, [envp]
+    mov rax, SYS_EXECVE
+    syscall
+    mov rax, SYS_EXIT               ; execve failed — die quietly
+    mov edi, 127
+    syscall
+.oc_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     ret
 
 ; ============================================================================
@@ -2018,8 +2234,15 @@ event_loop:
     movzx eax, word [read_buf + 26]
     mov [hl_y2], ax
     mov byte [highlighting], 0
+    cmp byte [ocr_mode], 0
+    jne .el_ocr_grab
     call set_bounding_rect
     jmp .el_loop
+.el_ocr_grab:
+    ; OCR: the drag is done — capture the rect, hand off to tesseract,
+    ; and exit (the overlay dies with us; frame recomposites instantly).
+    call ocr_capture
+    jmp .el_exit
 
 .el_tick:
     ; Tick path is only useful in spotlight mode (cursor-follow redraw).
